@@ -20,21 +20,29 @@
 图片、视频、音频仍然各自保持独立的顺序和编号，前端会使用不同颜色的连线、缩略图
 和序号帮助区分。
 
-![多线输入](images/mixed-media-input-zh.png)
+<p align="center">
+  <img src="images/mixed-media-input-zh.png" alt="多线输入" width="560">
+</p>
 
 从 `Media` 输入端拖线到空白画布，会弹出快速创建菜单，可以直接创建对应的资源节点。
 点击虚拟连线中间的序号，会打开只有“删除”选项的小菜单。
 
-![快速创建媒体节点](images/quick-create-node-zh.png)
+<p align="center">
+  <img src="images/quick-create-node-zh.png" alt="快速创建媒体节点" width="460">
+</p>
 
 ### 完整的 `@` 参考素材编辑器
 
 在 **参考生视频** 模式中，在提示词里输入 `@` 即可选择已连接的图片、视频或独立音频。
 弹窗按照图片、视频、音频的顺序显示，并提供预览，方便快速辨认素材。
 
-![引用素材弹窗](images/mention-popup-zh.png)
+<p align="center">
+  <img src="images/mention-popup-zh.png" alt="引用素材弹窗" width="320">
+</p>
 
-![参考模式中的整体效果](images/reference-editor-zh.png)
+<p align="center">
+  <img src="images/reference-editor-zh.png" alt="参考模式中的整体效果" width="720">
+</p>
 
 默认使用**按序号**引用，因为显示更简洁；用户也可以切换为**按文件名**，在文件名
 本身更有辨识度时使用。
@@ -47,7 +55,9 @@
 
 在提示词编辑器中输入 `#`，即可创建可编辑的台词块。
 
-![台词块](images/dialogue-block-zh.png)
+<p align="center">
+  <img src="images/dialogue-block-zh.png" alt="台词块" width="560">
+</p>
 
 - `Enter`：结束当前台词块；
 - `Shift+Enter`：在台词块内部换行；

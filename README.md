@@ -20,14 +20,18 @@ Multiple links can enter the same port. Image, video, and audio order numbers
 are tracked independently, and each media type has its own wire color and
 preview style.
 
-![Mixed media input](images/mixed-media-input-en.png)
+<p align="center">
+  <img src="images/mixed-media-input-en.png" alt="Mixed media input" width="560">
+</p>
 
 This keeps the graph compact without losing ordering information. Drag from
 `Media` to an empty area of the canvas to quickly create a compatible media
 node. Click the number in the middle of a virtual media wire to open the small
 delete menu.
 
-![Quick-create media node](images/quick-create-node-en.png)
+<p align="center">
+  <img src="images/quick-create-node-en.png" alt="Quick-create media node" width="460">
+</p>
 
 ### A complete `@` reference editor
 
@@ -35,9 +39,13 @@ delete menu.
 image, video, or standalone audio resource. The popup presents images first,
 videos second, and audio last, with a preview for each item.
 
-![Reference popup](images/mention-popup-en.png)
+<p align="center">
+  <img src="images/mention-popup-en.png" alt="Reference popup" width="320">
+</p>
 
-![Reference editor](images/reference-editor-en.png)
+<p align="center">
+  <img src="images/reference-editor-en.png" alt="Reference editor" width="720">
+</p>
 
 References use **By index** by default because it is concise and easy to scan.
 **By filename** is available when the filename itself is more meaningful.
@@ -55,7 +63,9 @@ connect the media they actually want to use.
 
 Type `#` in the prompt editor to insert an editable dialogue block.
 
-![Dialogue block](images/dialogue-block-en.png)
+<p align="center">
+  <img src="images/dialogue-block-en.png" alt="Dialogue block" width="560">
+</p>
 
 - Press `Enter` to finish the block.
 - Press `Shift+Enter` to add a line break inside it.
