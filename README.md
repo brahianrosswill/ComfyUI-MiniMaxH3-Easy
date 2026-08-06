@@ -145,17 +145,15 @@ dimensions to multiples of 32. Available ratios are `1:1`, `2:3`, `3:2`, `3:4`,
 Selecting `Custom` reveals width and height and hides the aspect-ratio control.
 Custom width and height must be multiples of 32.
 
-### Seconds and FPS
+### Duration
 
-Duration is set in seconds from **4 to 20**. FPS can be adjusted from **1 to
-120** when Advanced options are enabled. The requested duration is aligned to
-MiniMax H3's frame rules internally.
+Duration is set in seconds from **4 to 20**. The requested duration is aligned
+to MiniMax H3's frame rules internally.
 
 ### Advanced options
 
 Advanced options are off by default. When enabled, they reveal:
 
-- FPS;
 - first/last-frame setup in I2V or First/Last Frame mode;
 - reference image size in Reference Video mode;
 - `@` display mode in Reference Video mode.
