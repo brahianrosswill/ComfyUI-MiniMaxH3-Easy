@@ -112,6 +112,11 @@ def _model_tokens(name: str) -> set[str]:
     return set(_normalise_model_name(name).split())
 
 
+def _is_minimax_h3_name(normalised: str, compact: str, tokens: set[str]) -> bool:
+    """Require an explicit MiniMax H3 identity before matching shared roles."""
+    return "minimaxh3" in compact or ("minimax" in tokens and "h3" in compact)
+
+
 def _is_weight_file(name: str) -> bool:
     return os.path.splitext(str(name or ""))[1].lower() in MODEL_FILE_EXTENSIONS
 
@@ -216,15 +221,22 @@ def _has_role(name: str, role: str) -> bool:
         # the match scoped to an H3-named path to avoid generic CLIP files.
         return "text encoder" in normalised and ("minimax" in tokens or "h3" in compact)
     if role == "video_vae":
-        return (
+        is_minimax_h3 = _is_minimax_h3_name(normalised, compact, tokens)
+        is_video_vae = (
             ("video" in tokens and "vae" in tokens)
             or "videovae" in compact
-        ) and "tae" not in tokens and "approx" not in tokens
+            # Diffusers-style exports may use MiniMax-H3/vae/... without the
+            # word "video". In H3, an unqualified VAE is the visual VAE.
+            or ("vae" in tokens and "audio" not in tokens and "audiovae" not in compact)
+        )
+        return is_minimax_h3 and is_video_vae and "tae" not in tokens and "approx" not in tokens
     if role == "audio_vae":
-        return (
+        is_minimax_h3 = _is_minimax_h3_name(normalised, compact, tokens)
+        is_audio_vae = (
             ("audio" in tokens and "vae" in tokens)
             or "audiovae" in compact
-        ) and "tae" not in tokens and "approx" not in tokens
+        )
+        return is_minimax_h3 and is_audio_vae and "tae" not in tokens and "approx" not in tokens
     return False
 
 
