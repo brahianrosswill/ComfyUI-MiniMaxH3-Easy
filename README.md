@@ -91,11 +91,12 @@ The all-in-one loader exposes separate choices for:
 Official and common community filename variants are recognized, including
 BF16, FP8, INT8, INT4, NVFP4, NF4, and GGUF releases.
 
-Either FL2VA or Ref2VA can be set to `None`. When both models are available,
-the node prefers FL2VA for text-to-video and I2V/first-last-frame generation,
-and Ref2VA for reference-video generation. When only one transformer is
-installed, it is automatically reused for every generation mode. At least one
-of the two transformer models must be selected.
+To use only one transformer model, set the other model selector to `None`. The
+remaining model will automatically be used for text-to-video,
+I2V/first-last-frame, and reference-video generation. When both models are
+available, the node prefers FL2VA for text-to-video and I2V/first-last-frame
+generation, and Ref2VA for reference-video generation. At least one of the two
+transformer models must be selected.
 
 ### MiniMax H3 Easy
 
