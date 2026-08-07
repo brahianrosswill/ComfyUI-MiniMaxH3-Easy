@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -34,6 +35,9 @@ REF_IMAGE_1K = "1k"
 REF_IMAGE_2K = "2k"
 REFERENCE_MENTION_FILENAME = "filename"
 REFERENCE_MENTION_INDEX = "index"
+NONE_MODEL = "none"
+NONE_MODEL_DISPLAY_VALUES = (NONE_MODEL, "None", "无")
+NONE_MODEL_ALIASES = {value.lower() for value in NONE_MODEL_DISPLAY_VALUES}
 RESOLUTION_360 = "360P"
 RESOLUTION_416 = "416P"
 RESOLUTION_480 = "480P"
@@ -252,10 +256,23 @@ def _sort_model_names(names: list[str]) -> list[str]:
     return sorted(names, key=sort_key)
 
 
+def _is_none_model(value: Any) -> bool:
+    return str(value or "").strip().lower() in NONE_MODEL_ALIASES
+
+
 def _role_choices(role: str, categories: tuple[str, ...], fallback: str) -> list[str]:
     names = _collect_weight_names(categories)
     selected = [name for name in names if _has_role(name, role)]
     return _sort_model_names(selected) or [fallback]
+
+
+def _optional_role_choices(role: str, categories: tuple[str, ...]) -> list[str]:
+    names = _collect_weight_names(categories)
+    selected = _sort_model_names([name for name in names if _has_role(name, role)])
+    # ComfyUI validates combo values before invoking the node. The frontend
+    # localizes the sentinel to either "None" or "无", so all display values
+    # must also be accepted by the server-side combo definition.
+    return [*selected, *NONE_MODEL_DISPLAY_VALUES]
 
 
 def _filtered_choices(category: str, needles: tuple[str, ...], fallback: str) -> list[str]:
@@ -265,11 +282,11 @@ def _filtered_choices(category: str, needles: tuple[str, ...], fallback: str) ->
 
 
 def _model_choices() -> list[str]:
-    return _role_choices("fl2va", ("diffusion_models", "unet", "unet_gguf"), "minimax_h3_fl2va_pruned_int8_convrot.safetensors")
+    return _optional_role_choices("fl2va", ("diffusion_models", "unet", "unet_gguf"))
 
 
 def _ref_model_choices() -> list[str]:
-    return _role_choices("ref2va", ("diffusion_models", "unet", "unet_gguf"), "minimax_h3_ref2va_pruned_int8_convrot.safetensors")
+    return _optional_role_choices("ref2va", ("diffusion_models", "unet", "unet_gguf"))
 
 
 def _clip_choices() -> list[str]:
@@ -358,6 +375,15 @@ class MiniMaxH3Bundle:
                 comfy.model_management.soft_empty_cache()
 
             model_name = self.ref2va_model_name if kind == "ref2va" else self.fl2va_model_name
+            if _is_none_model(model_name):
+                if kind == "ref2va":
+                    raise ValueError(
+                        "Reference Video mode requires a REF2VA model. Select one in the MiniMax H3 Easy Loader."
+                    )
+                raise ValueError(
+                    "Text-to-video and I2V or First/Last Frame mode require an FL2VA model. "
+                    "Select one in the MiniMax H3 Easy Loader."
+                )
             if _is_gguf_file(model_name):
                 self._model = _load_gguf_unet(model_name)
             else:
@@ -387,7 +413,7 @@ class MiniMaxH3EasyLoader:
     FUNCTION = "load"
     RETURN_TYPES = ("MINIMAX_H3_BUNDLE",)
     RETURN_NAMES = ("h3_bundle",)
-    DESCRIPTION = "Load the MiniMax H3 transformers, text encoder and both AV VAEs as one bundle."
+    DESCRIPTION = "Load either or both MiniMax H3 transformers, plus the text encoder and both AV VAEs."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -406,6 +432,8 @@ class MiniMaxH3EasyLoader:
         return "|".join(str(kwargs.get(key, "")) for key in ("fl2va_model", "ref2va_model", "text_encoder", "video_vae", "audio_vae"))
 
     def load(self, fl2va_model, ref2va_model, text_encoder, video_vae, audio_vae):
+        if _is_none_model(fl2va_model) and _is_none_model(ref2va_model):
+            raise ValueError("Select at least one MiniMax H3 transformer: FL2VA or REF2VA.")
         clip = _load_text_encoder(text_encoder)
         video_vae_obj, = nodes.VAELoader().load_vae(video_vae)
         audio_vae_obj, = nodes.VAELoader().load_vae(audio_vae)
@@ -426,14 +454,14 @@ def _infer_media_type(value: Any) -> str:
         return ""
     if isinstance(value, torch.Tensor):
         return "image"
-    if isinstance(value, dict) and "waveform" in value:
+    if isinstance(value, Mapping) and "waveform" in value:
         return "audio"
     if hasattr(value, "get_components"):
         return "video"
     return "video"
 
 
-def _audio_sample_rate(audio: dict) -> int:
+def _audio_sample_rate(audio: Mapping) -> int:
     return int(audio.get("sample_rate") or audio.get("samplerate") or audio.get("sampler_rate") or 32000)
 
 
@@ -441,7 +469,7 @@ def _video_parts(value: Any) -> tuple[torch.Tensor, dict | None, float]:
     if hasattr(value, "get_components"):
         components = value.get_components()
         return components.images, components.audio, float(components.frame_rate or 24.0)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         frames = value.get("images")
         if frames is None:
             frames = value.get("frames")
@@ -460,7 +488,7 @@ def _resample_video_frames(frames: torch.Tensor, source_fps: float) -> torch.Ten
     return frames[indexes]
 
 
-def _encode_reference_audio(audio_vae, audio: dict):
+def _encode_reference_audio(audio_vae, audio: Mapping):
     waveform = audio["waveform"]
     sample_rate = _audio_sample_rate(audio)
     vae_sample_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
@@ -608,7 +636,7 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
         tag_by_input[item.input_index] = f"<Video {video_ordinal}>"
 
     for item in audios:
-        if not isinstance(item.value, dict) or "waveform" not in item.value:
+        if not isinstance(item.value, Mapping) or "waveform" not in item.value:
             raise ValueError("Audio references must be AUDIO payloads")
         audio_latent, audio_t = _encode_reference_audio(bundle.audio_vae, item.value)
         audio_ordinal += 1
