@@ -361,34 +361,49 @@ class MiniMaxH3Bundle:
     def __post_init__(self) -> None:
         self._model = None
         self._model_kind = ""
+        self._model_name = ""
         self._lock = threading.RLock()
+
+    def _model_name_for(self, kind: str) -> str:
+        """Return the preferred model, falling back to the other H3 model.
+
+        FL2VA and REF2VA are exposed as separate choices when both are
+        installed, but a user may intentionally install only one of them for
+        testing. In that case, let the remaining transformer serve either
+        generation path instead of rejecting the mode before execution.
+        """
+        requested_kind = "ref2va" if kind == "ref2va" else "fl2va"
+        preferred = self.ref2va_model_name if requested_kind == "ref2va" else self.fl2va_model_name
+        if not _is_none_model(preferred):
+            return preferred
+
+        fallback = self.fl2va_model_name if requested_kind == "ref2va" else self.ref2va_model_name
+        if not _is_none_model(fallback):
+            return fallback
+
+        if requested_kind == "ref2va":
+            raise ValueError("Reference Video mode requires at least one MiniMax H3 transformer model.")
+        raise ValueError("Text-to-video and I2V or First/Last Frame mode require at least one MiniMax H3 transformer model.")
 
     def model_for(self, kind: str):
         kind = "ref2va" if kind == "ref2va" else "fl2va"
         with self._lock:
-            if self._model is not None and self._model_kind == kind:
+            model_name = self._model_name_for(kind)
+            if self._model is not None and self._model_name == model_name:
                 return self._model
 
             if self._model is not None:
                 self._model = None
                 self._model_kind = ""
+                self._model_name = ""
                 comfy.model_management.soft_empty_cache()
 
-            model_name = self.ref2va_model_name if kind == "ref2va" else self.fl2va_model_name
-            if _is_none_model(model_name):
-                if kind == "ref2va":
-                    raise ValueError(
-                        "Reference Video mode requires a REF2VA model. Select one in the MiniMax H3 Easy Loader."
-                    )
-                raise ValueError(
-                    "Text-to-video and I2V or First/Last Frame mode require an FL2VA model. "
-                    "Select one in the MiniMax H3 Easy Loader."
-                )
             if _is_gguf_file(model_name):
                 self._model = _load_gguf_unet(model_name)
             else:
                 self._model, = nodes.UNETLoader().load_unet(model_name, "default")
             self._model_kind = kind
+            self._model_name = model_name
             return self._model
 
 
