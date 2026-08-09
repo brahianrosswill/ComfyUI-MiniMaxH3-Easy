@@ -291,13 +291,32 @@ contain only controls relevant to the current mode:
 
 - FPS;
 - first-frame or last-frame priority;
-- reference image short-edge limit: 1K or 2K;
+- reference image sizing: match generation size, 1K/1.5K/2K pixel area,
+  or original size;
 - `@` display by index or filename;
 - Optimizer settings popup switch;
 - per-node Prompt Guide.
 
-Reference images below the selected short-edge limit retain their resolution.
-Larger images are resized proportionally.
+### Reference image sizing
+
+Reference image resizing uses one uniform scale factor, so the image is not
+stretched independently along the horizontal and vertical axes. The available
+modes are:
+
+- **Match generation size**: scales each reference image toward the current
+  video generation pixel area, following the official H3 reference pipeline.
+- **1K area**: approximately `1 MP` (`1024 x 1024` equivalent).
+- **1.5K area**: approximately `2.25 MP` (`1536 x 1536` equivalent).
+- **2K area**: approximately `4 MP` (`2048 x 2048` equivalent).
+- **Original**: sends the connected image to the reference VAE without image-
+  side resizing. This can use substantially more memory with high-resolution
+  or numerous references.
+
+The area presets resize down only. H3-aligned dimensions are selected near the
+target area while prioritizing the source aspect ratio; reference images are
+not cropped. The setting affects reference-image conditioning only and does
+not change the video's generation width, height, resolution preset, duration,
+or FPS.
 
 ## Installation
 
