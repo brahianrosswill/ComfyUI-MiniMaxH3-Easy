@@ -12,6 +12,14 @@ import os
 import re
 import sys
 import threading
+import base64
+import asyncio
+import json
+import mimetypes
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
@@ -90,8 +98,22 @@ MAX_MEDIA = 15
 MAX_IMAGES = 9
 MAX_VIDEOS = 3
 MAX_AUDIOS = 3
-MIN_SECONDS = 4.0
-MAX_SECONDS = 20.0
+MIN_SECONDS = 0.2
+MAX_SECONDS = 30.0
+PROMPT_GUIDES_DIR = os.path.join(os.path.dirname(__file__), "prompt_guides")
+PROMPT_GUIDE_MANIFEST = os.path.join(PROMPT_GUIDES_DIR, "manifest.json")
+PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
+PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
+PROMPT_OPTIMIZER_CONFIG_VERSION = 1
+PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
+    "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
+    "api_format": "openai",
+    "api_url": "",
+    "api_key": "",
+    "model": "",
+    "read_media": False,
+}
+_PROMPT_OPTIMIZER_CONFIG_LOCK = threading.RLock()
 REFERENCE_PLACEHOLDER_RE = re.compile(r"__MINIMAX_H3_REF_(\d+)__")
 UNRESOLVED_REFERENCE_RE = re.compile(r"__MINIMAX_H3_UNRESOLVED_REF_[^_]+__")
 MODEL_FILE_EXTENSIONS = {".safetensors", ".gguf"}
@@ -260,6 +282,482 @@ def _is_none_model(value: Any) -> bool:
     return str(value or "").strip().lower() in NONE_MODEL_ALIASES
 
 
+def _read_prompt_guide_text(relative_path: str) -> str:
+    path = os.path.realpath(os.path.join(PROMPT_GUIDES_DIR, str(relative_path or "")))
+    root = os.path.realpath(PROMPT_GUIDES_DIR)
+    if not path.startswith(root + os.sep) or not os.path.isfile(path):
+        raise ValueError(f"Prompt guide file not found: {relative_path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+@lru_cache(maxsize=1)
+def _prompt_guide_manifest() -> dict[str, Any]:
+    try:
+        with open(PROMPT_GUIDE_MANIFEST, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _prompt_guide_bundle(scene_guide: str, mode: str, seconds: float, media_counts: Mapping[str, int]) -> str:
+    manifest = _prompt_guide_manifest()
+    general = manifest.get("general") if isinstance(manifest.get("general"), dict) else {}
+    blocks = [
+        "You are the MiniMax H3 Prompt Optimizer inside a ComfyUI node.",
+        "Return only the final prompt text. Do not add explanations, markdown fences, titles, or commentary.",
+        "Use the complete prompt guide text below. Preserve all official field names, section order, labels, timing notation, dialogue language, and reference tags.",
+        f"Node context: mode={mode}; duration_seconds={float(seconds):.2f}; media_counts={dict(media_counts)}.",
+    ]
+    if general.get("path"):
+        blocks.append("=== H3 GENERAL PROMPT GUIDE ===\n" + _read_prompt_guide_text(str(general["path"])))
+    if general.get("base_reference") and mode != MODE_REFERENCE:
+        blocks.append("=== H3 BASE REFERENCE GUIDE ===\n" + _read_prompt_guide_text(str(general["base_reference"])))
+    if general.get("ref_reference") and mode == MODE_REFERENCE:
+        blocks.append("=== H3 FULL-REFERENCE GUIDE ===\n" + _read_prompt_guide_text(str(general["ref_reference"])))
+    if scene_guide and scene_guide != "none":
+        for item in manifest.get("scene_guides") or []:
+            if isinstance(item, dict) and str(item.get("id")) == scene_guide and item.get("path"):
+                scene_path = str(item["path"])
+                blocks.append("=== SELECTED SCENE PROMPT GUIDE ===\n" + _read_prompt_guide_text(scene_path))
+                reference_dir = os.path.join(PROMPT_GUIDES_DIR, os.path.dirname(scene_path), "references")
+                if os.path.isdir(reference_dir):
+                    for root, _dirs, filenames in os.walk(reference_dir):
+                        for filename in sorted(filenames):
+                            if os.path.splitext(filename)[1].lower() not in {".md", ".txt"}:
+                                continue
+                            relative = os.path.relpath(os.path.join(root, filename), PROMPT_GUIDES_DIR).replace(os.sep, "/")
+                            blocks.append(f"=== SELECTED SCENE REFERENCE: {relative} ===\n" + _read_prompt_guide_text(relative))
+                break
+    return "\n\n".join(blocks)
+
+
+def _prompt_optimizer_config_path() -> str:
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "prompt_optimizer.json")
+
+
+def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    api_format = str(source.get("api_format") or "openai").strip().lower()
+    if api_format not in {"openai", "gemini"}:
+        api_format = "openai"
+    read_media = source.get("read_media", False)
+    if isinstance(read_media, str):
+        read_media = read_media.strip().lower() in {"1", "true", "yes", "on"}
+    return {
+        "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
+        "api_format": api_format,
+        "api_url": str(source.get("api_url") or "").strip(),
+        "api_key": str(source.get("api_key") or ""),
+        "model": str(source.get("model") or "").strip(),
+        "read_media": bool(read_media),
+    }
+
+
+def _read_prompt_optimizer_config() -> dict[str, Any]:
+    path = _prompt_optimizer_config_path()
+    with _PROMPT_OPTIMIZER_CONFIG_LOCK:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            return dict(PROMPT_OPTIMIZER_CONFIG_DEFAULTS)
+    return _normalize_prompt_optimizer_config(payload)
+
+
+def _write_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    normalized = _normalize_prompt_optimizer_config(value)
+    path = _prompt_optimizer_config_path()
+    directory = os.path.dirname(path)
+    temporary_path = ""
+    with _PROMPT_OPTIMIZER_CONFIG_LOCK:
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=directory,
+                prefix=".prompt_optimizer.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = handle.name
+                json.dump(normalized, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+    return normalized
+
+
+_OPTIMIZER_KNOWN_ENDPOINT_SUFFIXES = (
+    "/v1/chat/completions",
+    "/chat/completions",
+)
+_OPTIMIZER_GEMINI_ENDPOINT_RE = re.compile(
+    r"/(v1beta|v1)/models/[^/?:#]+?:(generateContent|streamGenerateContent)$",
+    flags=re.I,
+)
+
+
+def _normalize_optimizer_base_url(api_url: str) -> str:
+    base = str(api_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("Prompt optimization API URL is required")
+    if not re.match(r"^https?://", base, flags=re.I):
+        base = "https://" + base
+    return base.rstrip("/")
+
+
+def _optimizer_endpoint_kind(value: str) -> str:
+    lower = str(value or "").lower()
+    if lower.endswith("/chat/completions"):
+        return "chat"
+    if _OPTIMIZER_GEMINI_ENDPOINT_RE.search(lower):
+        return "gemini"
+    return ""
+
+
+def _normalize_gemini_model_id(model: str) -> str:
+    """Accept a bare model ID, ``models/<id>``, or a full Gemini model URL."""
+    raw = urllib.parse.unquote(str(model or "").strip())
+    if not raw:
+        raise ValueError("Prompt optimization model is required")
+    if "://" in raw:
+        raw = urllib.parse.urlsplit(raw).path
+    raw = raw.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
+    match = re.search(r"(?:^|/)models/([^/:]+)(?::[A-Za-z]+)?$", raw, flags=re.I)
+    if match:
+        raw = match.group(1)
+    else:
+        if raw.lower().startswith("models/"):
+            raw = raw[7:]
+        raw = raw.rsplit("/", 1)[-1]
+        raw = re.sub(r":(?:generateContent|streamGenerateContent)$", "", raw, flags=re.I)
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("Prompt optimization model is required")
+    return raw
+
+
+def _gemini_url_with_query(url: str, query: str) -> str:
+    # ``alt=sse`` belongs to streamGenerateContent and would corrupt the JSON
+    # response expected from generateContent. Preserve other proxy parameters.
+    pairs = [(key, value) for key, value in urllib.parse.parse_qsl(query, keep_blank_values=True) if key.lower() != "alt"]
+    encoded = urllib.parse.urlencode(pairs)
+    return url + (f"?{encoded}" if encoded else "")
+
+
+def _normalize_gemini_optimizer_url(api_url: str, model: str) -> str:
+    base = _normalize_optimizer_base_url(api_url)
+    parsed = urllib.parse.urlsplit(base)
+    clean = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    lower = clean.lower()
+    model_id = urllib.parse.quote(_normalize_gemini_model_id(model), safe=".-_")
+
+    endpoint_match = _OPTIMIZER_GEMINI_ENDPOINT_RE.search(lower)
+    if endpoint_match and lower.endswith(endpoint_match.group(0)):
+        version = endpoint_match.group(1)
+        clean = clean[: endpoint_match.start()].rstrip("/")
+        url = f"{clean}/{version}/models/{model_id}:generateContent"
+        return _gemini_url_with_query(url, parsed.query)
+
+    if lower.endswith("/v1beta/models") or lower.endswith("/v1/models"):
+        url = f"{clean}/{model_id}:generateContent"
+    elif lower.endswith("/v1beta") or lower.endswith("/v1"):
+        url = f"{clean}/models/{model_id}:generateContent"
+    elif lower.endswith("/models"):
+        url = f"{clean}/{model_id}:generateContent"
+    else:
+        url = f"{clean}/v1beta/models/{model_id}:generateContent"
+    return _gemini_url_with_query(url, parsed.query)
+
+
+def _strip_optimizer_endpoint(base: str) -> str:
+    lower = base.lower()
+    for suffix in _OPTIMIZER_KNOWN_ENDPOINT_SUFFIXES:
+        if lower.endswith(suffix):
+            return base[: len(base) - len(suffix)].rstrip("/")
+    match = _OPTIMIZER_GEMINI_ENDPOINT_RE.search(lower)
+    if match and lower.endswith(match.group(0)):
+        return base[: match.start()].rstrip("/")
+    return base
+
+
+def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
+    if api_format == "gemini":
+        return _normalize_gemini_optimizer_url(api_url, model)
+    base = _normalize_optimizer_base_url(api_url)
+    endpoint = "/v1/chat/completions"
+    base_kind = _optimizer_endpoint_kind(base)
+    endpoint_kind = _optimizer_endpoint_kind(endpoint)
+    if base_kind == endpoint_kind == "chat":
+        return base
+    if base_kind == endpoint_kind == "gemini":
+        base_match = _OPTIMIZER_GEMINI_ENDPOINT_RE.search(base.lower())
+        if base_match and base.lower().endswith(base_match.group(0)) and base_match.group(0) == endpoint.lower():
+            return base
+    base = _strip_optimizer_endpoint(base)
+    if base.lower().endswith("/v1") and endpoint.lower().startswith("/v1/"):
+        endpoint = endpoint[3:]
+    if base.lower().endswith("/v1beta") and endpoint.lower().startswith("/v1beta/"):
+        endpoint = endpoint[7:]
+    return base + endpoint
+
+
+def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str, system_prompt: str, user_prompt: str, media_parts: list[dict[str, Any]] | None = None) -> str:
+    url = _normalize_optimizer_url(api_url, api_format, model)
+    media_parts = list(media_parts or [])
+    if api_format == "gemini":
+        headers = {"Content-Type": "application/json", "Accept": "application/json", "x-goog-api-key": api_key}
+        # Some Gemini-compatible channels accept the native payload and return
+        # candidates but silently ignore systemInstruction. Keep the complete
+        # Prompt Guide and the user's source prompt in the same user text part,
+        # matching the node's previously verified working Gemini request.
+        instruction_and_prompt = (
+            system_prompt
+            + "\n\n=== USER PROMPT TO OPTIMIZE ===\n"
+            + user_prompt
+            + "\n\nFollow the Prompt Guide above and return only the final rewritten MiniMax H3 prompt."
+        )
+        parts = [{"text": instruction_and_prompt}] + media_parts
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"temperature": 0.35, "maxOutputTokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS},
+        }
+    else:
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        content: str | list[dict[str, Any]]
+        if media_parts:
+            content = [{"type": "text", "text": user_prompt}, *media_parts]
+        else:
+            content = user_prompt
+        payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}], "stream": False, "temperature": 0.35, "max_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS}
+    request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Prompt optimization API error ({exc.code}): {detail[:1000]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Prompt optimization request failed: {exc.reason}") from exc
+    if api_format == "gemini":
+        candidates = data.get("candidates") if isinstance(data, dict) else None
+        if not isinstance(candidates, list) or not candidates:
+            feedback = data.get("promptFeedback") if isinstance(data, dict) else None
+            reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+            detail = f": {reason}" if reason else ""
+            raise RuntimeError(f"Gemini API returned no candidates{detail}")
+        candidate = candidates[0] if isinstance(candidates[0], dict) else {}
+        parts = candidate.get("content", {}).get("parts", []) if isinstance(candidate.get("content"), dict) else []
+        text = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict) and part.get("text") is not None)
+        if not text.strip():
+            finish_reason = candidate.get("finishReason") or candidate.get("finish_reason") or "unknown"
+            raise RuntimeError(f"Gemini API returned no text (finish reason: {finish_reason})")
+    else:
+        content = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "")
+        text = content if isinstance(content, str) else "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+    text = str(text or "").strip()
+    if not text:
+        raise RuntimeError("Prompt optimization API returned an empty response")
+    return text
+
+
+def _optimizer_asset_path(asset: Mapping[str, Any]) -> str | None:
+    filename = str(asset.get("filename") or "").strip()
+    if not filename or os.path.isabs(filename):
+        return None
+    storage = str(asset.get("storage") or "input").lower()
+    roots = {
+        "input": folder_paths.get_input_directory(),
+        "output": folder_paths.get_output_directory(),
+        "temp": folder_paths.get_temp_directory(),
+    }
+    root = os.path.realpath(roots.get(storage, roots["input"]))
+    subfolder = str(asset.get("subfolder") or "").replace("\\", "/").strip("/")
+    candidate = os.path.realpath(os.path.join(root, subfolder, filename))
+    if candidate != root and not candidate.startswith(root + os.sep):
+        return None
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _optimizer_media_parts(resources: list[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    for resource in resources[:MAX_MEDIA]:
+        asset = resource.get("asset") if isinstance(resource.get("asset"), Mapping) else {}
+        path = _optimizer_asset_path(asset)
+        media_type = str(resource.get("type") or "").lower()
+        if not path or media_type not in {"image", "video", "audio"}:
+            continue
+        try:
+            if os.path.getsize(path) > 32 * 1024 * 1024:
+                continue
+            with open(path, "rb") as handle:
+                encoded = base64.b64encode(handle.read()).decode("ascii")
+            mime = mimetypes.guess_type(path)[0] or {"image": "image/jpeg", "video": "video/mp4", "audio": "audio/wav"}[media_type]
+            if api_format == "gemini":
+                parts.append({"inlineData": {"mimeType": mime, "data": encoded}})
+            elif media_type == "image":
+                parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+        except (OSError, ValueError):
+            continue
+    return parts
+
+
+def _media_counts_from_kwargs(kwargs: Mapping[str, Any]) -> dict[str, int]:
+    counts = {"image": 0, "video": 0, "audio": 0}
+    for index in range(1, MAX_MEDIA + 1):
+        kind = str(kwargs.get(f"media_type_{index}") or "").lower()
+        if kind in counts and kwargs.get(f"media_{index}") is not None:
+            counts[kind] += 1
+    direct = kwargs.get("media")
+    if direct is not None:
+        counts[_infer_media_type(direct)] += 1
+    return counts
+
+
+def _optimizer_system_prompt(
+    scene_guide: str,
+    mode: str,
+    seconds: float,
+    media_counts: Mapping[str, int],
+    attached_media_count: int = 0,
+) -> str:
+    prompt = _prompt_guide_bundle(scene_guide, mode, seconds, media_counts)
+    actual_count = max(0, int(attached_media_count or 0))
+    if actual_count:
+        prompt += (
+            "\n\n=== MEDIA EVIDENCE RULE ===\n"
+            f"Actual media parts attached to this request: {actual_count}.\n"
+            "The presence of a media part in the request does not prove that you can perceive it. "
+            "Use visual, video, or audio details only when they are directly observable to your model in the attached media parts. "
+            "If your model or API does not support the media modality, treat that media as unavailable. "
+            "Do not invent or confidently describe details for any referenced media that is not actually attached. "
+            "For a media tag without corresponding attached evidence, preserve the tag and infer only from the original user prompt and explicit instructions, never from an imagined asset."
+        )
+    else:
+        prompt += (
+            "\n\n=== MEDIA EVIDENCE RULE ===\n"
+            "No actual media file was attached to this request. Do not invent, hallucinate, or confidently describe the content of any image, video, or audio reference. "
+            "Preserve media reference tags when needed, but infer only from the original user prompt and explicit instructions. Never fabricate a subject, appearance, action, setting, sound, or other media detail."
+        )
+    return prompt
+
+
+class MiniMaxH3PromptOptimizer:
+    CATEGORY = "MiniMax H3 Easy"
+    FUNCTION = "optimize"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("optimized_prompt",)
+    OUTPUT_NODE = True
+    DESCRIPTION = "Optimize a MiniMax H3 prompt with the complete node-adapted Prompt Guide."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        manifest = _prompt_guide_manifest()
+        scene_items = manifest.get("scene_guides") if isinstance(manifest.get("scene_guides"), list) else []
+        choices = [str(item.get("id")) for item in scene_items if isinstance(item, dict) and item.get("id")] or ["none"]
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "mode": ([MODE_IMAGE, MODE_REFERENCE], {"default": MODE_IMAGE}),
+                "seconds": ("FLOAT", {"default": 5.0, "min": MIN_SECONDS, "max": MAX_SECONDS, "step": 0.1}),
+                "scene_guide": (choices, {"default": "none"}),
+                "api_format": (["openai", "gemini"], {"default": "openai"}),
+                "api_url": ("STRING", {"default": ""}),
+                "api_key": ("STRING", {"default": "", "multiline": False, "password": True}),
+                "model": ("STRING", {"default": ""}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def optimize(self, prompt, mode, seconds, scene_guide, api_format, api_url, api_key, model):
+        if not str(api_key or "").strip():
+            raise ValueError("Prompt optimization API key is required")
+        if not str(model or "").strip():
+            raise ValueError("Prompt optimization model is required")
+        counts = {"image": 0, "video": 0, "audio": 0}
+        system = _optimizer_system_prompt(str(scene_guide or "none"), str(mode or MODE_IMAGE), float(seconds), counts)
+        return (_optimizer_http_json(str(api_url), str(api_key), str(model), str(api_format or "openai"), system, str(prompt or "")),)
+
+
+def _register_prompt_optimizer_route() -> bool:
+    try:
+        from aiohttp import web
+        from server import PromptServer
+    except Exception:
+        return False
+    routes = getattr(getattr(PromptServer, "instance", None), "routes", None)
+    if routes is None or getattr(_register_prompt_optimizer_route, "_registered", False):
+        return bool(getattr(_register_prompt_optimizer_route, "_registered", False))
+
+    @routes.get("/minimax_h3_easy/prompt_optimizer_settings")
+    async def _prompt_optimizer_settings_get(request):
+        return web.json_response({"ok": True, "settings": _read_prompt_optimizer_config()})
+
+    @routes.post("/minimax_h3_easy/prompt_optimizer_settings")
+    async def _prompt_optimizer_settings_post(request):
+        try:
+            payload = await request.json()
+            settings = _write_prompt_optimizer_config(payload if isinstance(payload, dict) else {})
+            return web.json_response({"ok": True, "settings": settings})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    @routes.post("/minimax_h3_easy/prompt_optimize")
+    async def _prompt_optimize(request):
+        try:
+            payload = await request.json()
+            prompt = str(payload.get("prompt") or "")
+            settings = _read_prompt_optimizer_config()
+            api_key = str(settings.get("api_key") or "")
+            api_url = str(settings.get("api_url") or "")
+            model = str(settings.get("model") or "")
+            api_format = str(settings.get("api_format") or "openai").lower()
+            mode = str(payload.get("mode") or MODE_IMAGE)
+            scene_guide = str(payload.get("scene_guide") or "none")
+            seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(payload.get("seconds") or 5.0)))
+            if api_format not in {"openai", "gemini"}:
+                return web.json_response({"ok": False, "error": "Unsupported API format"}, status=400)
+            if not prompt.strip() or not api_key.strip() or not api_url.strip() or not model.strip():
+                return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
+            raw_counts = payload.get("media_counts") if isinstance(payload.get("media_counts"), dict) else {}
+            counts = {kind: max(0, min(MAX_MEDIA, int(raw_counts.get(kind, 0) or 0))) for kind in ("image", "video", "audio")}
+            resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
+            media_parts = _optimizer_media_parts(resources, api_format) if bool(settings.get("read_media")) else []
+            system = _optimizer_system_prompt(scene_guide, mode, seconds, counts, len(media_parts))
+            result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
+            return web.json_response({"ok": True, "prompt": result})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    _register_prompt_optimizer_route._registered = True
+    return True
+
+
+def _register_prompt_optimizer_route_when_ready() -> None:
+    if _register_prompt_optimizer_route():
+        return
+
+    def wait_for_server() -> None:
+        # ComfyUI creates PromptServer shortly after custom-node imports. Retry
+        # for a bounded period without delaying node import.
+        for _ in range(2400):
+            if _register_prompt_optimizer_route():
+                return
+            threading.Event().wait(0.05)
+
+    threading.Thread(target=wait_for_server, daemon=True, name="MiniMaxH3PromptOptimizerRoute").start()
+
+
 def _role_choices(role: str, categories: tuple[str, ...], fallback: str) -> list[str]:
     names = _collect_weight_names(categories)
     selected = [name for name in names if _has_role(name, role)]
@@ -357,6 +855,8 @@ class MiniMaxH3Bundle:
     clip: Any
     video_vae: Any
     audio_vae: Any
+    fl2va_model_obj: Any = None
+    ref2va_model_obj: Any = None
 
     def __post_init__(self) -> None:
         self._model = None
@@ -385,9 +885,21 @@ class MiniMaxH3Bundle:
             raise ValueError("Reference Video mode requires at least one MiniMax H3 transformer model.")
         raise ValueError("Text-to-video and I2V or First/Last Frame mode require at least one MiniMax H3 transformer model.")
 
+    def _model_object_for(self, kind: str):
+        """Return an already-loaded transformer, falling back to the other role."""
+        requested_kind = "ref2va" if kind == "ref2va" else "fl2va"
+        preferred = self.ref2va_model_obj if requested_kind == "ref2va" else self.fl2va_model_obj
+        if preferred is not None:
+            return preferred
+        fallback = self.fl2va_model_obj if requested_kind == "ref2va" else self.ref2va_model_obj
+        return fallback
+
     def model_for(self, kind: str):
         kind = "ref2va" if kind == "ref2va" else "fl2va"
         with self._lock:
+            supplied_model = self._model_object_for(kind)
+            if supplied_model is not None:
+                return supplied_model
             model_name = self._model_name_for(kind)
             if self._model is not None and self._model_name == model_name:
                 return self._model
@@ -464,6 +976,49 @@ class MiniMaxH3EasyLoader:
         ),)
 
 
+class MiniMaxH3EasyModelAdapter:
+    CATEGORY = "MiniMax H3 Easy"
+    FUNCTION = "assemble"
+    RETURN_TYPES = ("MINIMAX_H3_BUNDLE",)
+    RETURN_NAMES = ("h3_bundle",)
+    DESCRIPTION = "Assemble standard ComfyUI MODEL, CLIP and VAE outputs into a MiniMax H3 bundle."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text_encoder": ("CLIP",),
+                "video_vae": ("VAE",),
+                "audio_vae": ("VAE",),
+            },
+            "optional": {
+                "fl2va_model": ("MODEL",),
+                "ref2va_model": ("MODEL",),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    @staticmethod
+    def assemble(text_encoder, video_vae, audio_vae, fl2va_model=None, ref2va_model=None):
+        if fl2va_model is None and ref2va_model is None:
+            raise ValueError("Connect at least one transformer MODEL: FL2VA or REF2VA.")
+        return (MiniMaxH3Bundle(
+            fl2va_model_name=NONE_MODEL,
+            ref2va_model_name=NONE_MODEL,
+            clip_name="connected",
+            video_vae_name="connected",
+            audio_vae_name="connected",
+            clip=text_encoder,
+            video_vae=video_vae,
+            audio_vae=audio_vae,
+            fl2va_model_obj=fl2va_model,
+            ref2va_model_obj=ref2va_model,
+        ),)
+
+
 def _infer_media_type(value: Any) -> str:
     if value is None:
         return ""
@@ -520,11 +1075,14 @@ def _resolve_reference_prompt(
     video_count: int,
     standalone_audio_count: int,
 ) -> str:
-    if UNRESOLVED_REFERENCE_RE.search(str(prompt or "")):
-        raise ValueError("Prompt contains a disconnected media reference. Reconnect the media or remove the @ reference.")
+    # A workflow may intentionally contain fewer/more @ references than the
+    # currently connected media. Resolve valid placeholders, but preserve
+    # stale internal placeholders so the user's original reference is not
+    # silently discarded; the downstream model decides how to handle it.
+    source_prompt = str(prompt or "")
     resolved = REFERENCE_PLACEHOLDER_RE.sub(
         lambda match: tag_by_input.get(int(match.group(1)), ""),
-        str(prompt or ""),
+        source_prompt,
     )
     if soundtrack_pairs and (video_count > 1 or standalone_audio_count > 0):
         provenance = [
@@ -687,8 +1245,13 @@ class MiniMaxH3Easy:
     def INPUT_TYPES(cls):
         optional = {"media": ("*",)}
         for index in range(1, MAX_MEDIA + 1):
-            optional[f"media_{index}"] = ("*",)
-            optional[f"media_type_{index}"] = ("STRING", {"default": ""})
+            # Transport-only inputs used by the virtual multi-wire frontend.
+            # Keep them in INPUT_TYPES so ComfyUI execution can resolve the
+            # linked media objects, but mark them hidden as a server-side
+            # fallback: even if the web extension fails to initialize, users
+            # must never see thirty internal sockets/widgets on the node.
+            optional[f"media_{index}"] = ("*", {"hidden": True})
+            optional[f"media_type_{index}"] = ("STRING", {"default": "", "hidden": True})
         return {
             "required": {
                 "h3_bundle": ("MINIMAX_H3_BUNDLE",),
@@ -698,12 +1261,17 @@ class MiniMaxH3Easy:
                 "aspect_ratio": (list(ASPECT_RATIOS), {"default": ASPECT_WIDESCREEN}),
                 "width": ("INT", {"default": 1344, "min": 32, "max": nodes.MAX_RESOLUTION, "step": 32}),
                 "height": ("INT", {"default": 768, "min": 32, "max": nodes.MAX_RESOLUTION, "step": 32}),
-                "seconds": ("FLOAT", {"default": 5.0, "min": MIN_SECONDS, "max": MAX_SECONDS, "step": 1.0}),
+                "seconds": ("FLOAT", {"default": 5.0, "min": MIN_SECONDS, "max": MAX_SECONDS, "step": 0.1}),
                 "advanced": ("BOOLEAN", {"default": False}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
                 "keyframe_role": ([KEYFRAME_FIRST, KEYFRAME_LAST], {"default": KEYFRAME_FIRST}),
                 "ref_image_size": ([REF_IMAGE_1K, REF_IMAGE_2K], {"default": REF_IMAGE_1K}),
                 "reference_mention_mode": ([REFERENCE_MENTION_FILENAME, REFERENCE_MENTION_INDEX], {"default": REFERENCE_MENTION_INDEX}),
+                "prompt_optimizer_settings": ("BOOLEAN", {"default": False}),
+                "prompt_optimizer_scene_guide": (
+                    [str(item.get("id")) for item in (_prompt_guide_manifest().get("scene_guides") or []) if isinstance(item, dict) and item.get("id")] or ["none"],
+                    {"default": "none"},
+                ),
             },
             "optional": optional,
         }
@@ -810,8 +1378,12 @@ class MiniMaxH3EasyOutput:
         )
 
 
+_register_prompt_optimizer_route_when_ready()
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3EasyLoader": MiniMaxH3EasyLoader,
+    "MiniMaxH3EasyModelAdapter": MiniMaxH3EasyModelAdapter,
     "MiniMaxH3Easy": MiniMaxH3Easy,
     "MiniMaxH3EasyOutput": MiniMaxH3EasyOutput,
 }
