@@ -7,3 +7,4 @@ Thumbs.db
 .vscode/
 *.log
 prompt_optimizer.json
+tools/
