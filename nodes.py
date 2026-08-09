@@ -40,7 +40,10 @@ MODE_REFERENCE = "reference"
 KEYFRAME_FIRST = "first"
 KEYFRAME_LAST = "last"
 REF_IMAGE_1K = "1k"
+REF_IMAGE_15K = "1.5k"
 REF_IMAGE_2K = "2k"
+REF_IMAGE_MATCH = "match"
+REF_IMAGE_ORIGINAL = "original"
 REFERENCE_MENTION_FILENAME = "filename"
 REFERENCE_MENTION_INDEX = "index"
 NONE_MODEL = "none"
@@ -80,10 +83,12 @@ RESOLUTION_MEGAPIXELS = {
     RESOLUTION_1080: 2.0,
 }
 RESOLUTIONS = (*RESOLUTION_MEGAPIXELS, RESOLUTION_CUSTOM)
-REFERENCE_IMAGE_SHORT_EDGES = {
-    REF_IMAGE_1K: 1024,
-    REF_IMAGE_2K: h3.REF_IMAGE_SHORT_EDGE,
+REFERENCE_IMAGE_AREAS = {
+    REF_IMAGE_1K: 1024 * 1024,
+    REF_IMAGE_15K: 1536 * 1536,
+    REF_IMAGE_2K: 2048 * 2048,
 }
+REFERENCE_SIZE_SEARCH_RADIUS = 16
 ASPECT_RATIOS = {
     ASPECT_SQUARE: (1, 1),
     ASPECT_PHOTO_PORTRAIT: (2, 3),
@@ -113,6 +118,36 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "model": "",
     "read_media": False,
 }
+
+
+def _reference_aligned_size(image_w: int, image_h: int, scale: float) -> tuple[int, int]:
+    """Choose H3-aligned dimensions near the scaled area without stretching refs."""
+    multiple = h3.CANVAS_MULTIPLE
+    scaled_w = max(float(multiple), image_w * scale)
+    scaled_h = max(float(multiple), image_h * scale)
+    target_area = scaled_w * scaled_h
+    aspect = image_w / max(1, image_h)
+    center_h_units = max(1, round(scaled_h / multiple))
+    best = None
+
+    for h_units in range(
+        max(1, center_h_units - REFERENCE_SIZE_SEARCH_RADIUS),
+        center_h_units + REFERENCE_SIZE_SEARCH_RADIUS + 1,
+    ):
+        ideal_w_units = h_units * aspect
+        min_w_units = max(1, math.floor(ideal_w_units) - 2)
+        max_w_units = max(min_w_units, math.ceil(ideal_w_units) + 2)
+        for w_units in range(min_w_units, max_w_units + 1):
+            target_w = w_units * multiple
+            target_h = h_units * multiple
+            ratio_error = abs((target_w / target_h) / aspect - 1.0)
+            area_error = abs((target_w * target_h) / target_area - 1.0)
+            score = ratio_error * 20.0 + area_error
+            candidate = (score, ratio_error, area_error, target_w, target_h)
+            if best is None or candidate < best:
+                best = candidate
+
+    return best[3], best[4]
 _PROMPT_OPTIMIZER_CONFIG_LOCK = threading.RLock()
 REFERENCE_PLACEHOLDER_RE = re.compile(r"__MINIMAX_H3_REF_(\d+)__")
 UNRESOLVED_REFERENCE_RE = re.compile(r"__MINIMAX_H3_UNRESOLVED_REF_[^_]+__")
@@ -1157,10 +1192,30 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
         if not isinstance(image, torch.Tensor) or image.ndim != 4:
             raise ValueError("Image references must be IMAGE tensors")
         image_h, image_w = image.shape[1], image.shape[2]
-        short_edge_limit = REFERENCE_IMAGE_SHORT_EDGES.get(str(ref_image_size), REFERENCE_IMAGE_SHORT_EDGES[REF_IMAGE_1K])
-        scale = min(1.0, short_edge_limit / max(1, min(image_w, image_h)))
-        target_w = max(h3.CANVAS_MULTIPLE, round(image_w * scale / h3.CANVAS_MULTIPLE) * h3.CANVAS_MULTIPLE)
-        target_h = max(h3.CANVAS_MULTIPLE, round(image_h * scale / h3.CANVAS_MULTIPLE) * h3.CANVAS_MULTIPLE)
+        size_mode = str(ref_image_size or REF_IMAGE_MATCH)
+        if size_mode == REF_IMAGE_ORIGINAL:
+            # The explicit original mode keeps the incoming pixels untouched.
+            # The VAE reports the latent grid actually produced for arbitrary
+            # source dimensions, so no image-side 32-pixel resampling is needed.
+            resized = image[:1]
+            z = bundle.video_vae.encode(resized)
+            ref_items.append({"type": "image", "data": resized})
+            ref_blocks.append({
+                "kind": "image",
+                "latent_h": int(z.shape[-2]),
+                "latent_w": int(z.shape[-1]),
+                "latent": z,
+            })
+            tag_by_input[item.input_index] = f"<Picture {picture_ordinal}>"
+            continue
+        if size_mode == REF_IMAGE_MATCH:
+            target_area = width * height
+        else:
+            target_area = REFERENCE_IMAGE_AREAS.get(size_mode, REFERENCE_IMAGE_AREAS[REF_IMAGE_1K])
+        # Use one uniform scale factor for both axes so no non-uniform
+        # stretching is introduced before H3's internal size alignment.
+        scale = min(1.0, math.sqrt(target_area / max(1, image_w * image_h)))
+        target_w, target_h = _reference_aligned_size(image_w, image_h, scale)
         resized = h3._resize(image[:1], target_w, target_h, "disabled")
         ref_items.append({"type": "image", "data": resized})
         ref_blocks.append({"kind": "image", "latent_h": target_h // 16, "latent_w": target_w // 16, "latent": bundle.video_vae.encode(resized)})
@@ -1265,7 +1320,7 @@ class MiniMaxH3Easy:
                 "advanced": ("BOOLEAN", {"default": False}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
                 "keyframe_role": ([KEYFRAME_FIRST, KEYFRAME_LAST], {"default": KEYFRAME_FIRST}),
-                "ref_image_size": ([REF_IMAGE_1K, REF_IMAGE_2K], {"default": REF_IMAGE_1K}),
+                "ref_image_size": ([REF_IMAGE_MATCH, REF_IMAGE_1K, REF_IMAGE_15K, REF_IMAGE_2K, REF_IMAGE_ORIGINAL], {"default": REF_IMAGE_MATCH}),
                 "reference_mention_mode": ([REFERENCE_MENTION_FILENAME, REFERENCE_MENTION_INDEX], {"default": REFERENCE_MENTION_INDEX}),
                 "prompt_optimizer_settings": ("BOOLEAN", {"default": False}),
                 "prompt_optimizer_scene_guide": (

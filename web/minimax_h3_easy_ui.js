@@ -40,8 +40,11 @@ const MODE_IMAGE = "image";
 const MODE_REFERENCE = "reference";
 const KEYFRAME_FIRST = "first";
 const RESOLUTION_CUSTOM = "custom";
+const REF_IMAGE_MATCH = "match";
 const REF_IMAGE_1K = "1k";
+const REF_IMAGE_15K = "1.5k";
 const REF_IMAGE_2K = "2k";
+const REF_IMAGE_ORIGINAL = "original";
 const MAX_MEDIA = 15;
 const MIN_SECONDS = 0.2;
 const MAX_SECONDS = 30;
@@ -134,8 +137,11 @@ const OPTION_DEFS = {
         last: ZH_BROWSER ? "\u5c3e\u5e27\u4f18\u5148" : "Last frame priority",
     },
     ref_image_size: {
-        [REF_IMAGE_1K]: ZH_BROWSER ? "\u77ed\u8fb9\u6700\u59271K\u50cf\u7d20" : "Max 1K Short Edge",
-        [REF_IMAGE_2K]: ZH_BROWSER ? "\u77ed\u8fb9\u6700\u59272K\u50cf\u7d20" : "Max 2K Short Edge",
+        [REF_IMAGE_MATCH]: ZH_BROWSER ? "\u5339\u914d\u751f\u6210\u5206\u8fa8\u7387" : "Match generation size",
+        [REF_IMAGE_1K]: ZH_BROWSER ? "1K \u9762\u79ef\uff08\u7ea61MP\uff09" : "1K area (~1MP)",
+        [REF_IMAGE_15K]: ZH_BROWSER ? "1.5K \u9762\u79ef\uff08\u7ea62.25MP\uff09" : "1.5K area (~2.25MP)",
+        [REF_IMAGE_2K]: ZH_BROWSER ? "2K \u9762\u79ef\uff08\u7ea64MP\uff09" : "2K area (~4MP)",
+        [REF_IMAGE_ORIGINAL]: ZH_BROWSER ? "\u539f\u56fe\uff08\u4e0d\u7f29\u653e\uff09" : "Original (no scaling)",
     },
     reference_mention_mode: {
         filename: ZH_BROWSER ? "\u6309\u6587\u4ef6\u540d" : "By filename",
@@ -192,12 +198,25 @@ const OPTION_ALIASES = {
         "Last frame priority": "last",
     },
     ref_image_size: {
+        [REF_IMAGE_MATCH]: REF_IMAGE_MATCH,
+        "\u5339\u914d\u751f\u6210\u5206\u8fa8\u7387": REF_IMAGE_MATCH,
+        "Match generation size": REF_IMAGE_MATCH,
         [REF_IMAGE_1K]: REF_IMAGE_1K,
         "\u77ed\u8fb9\u6700\u59271K\u50cf\u7d20": REF_IMAGE_1K,
         "Max 1K Short Edge": REF_IMAGE_1K,
+        "1K \u9762\u79ef\uff08\u7ea61MP\uff09": REF_IMAGE_1K,
+        "1K area (~1MP)": REF_IMAGE_1K,
+        [REF_IMAGE_15K]: REF_IMAGE_15K,
+        "1.5K \u9762\u79ef\uff08\u7ea62.25MP\uff09": REF_IMAGE_15K,
+        "1.5K area (~2.25MP)": REF_IMAGE_15K,
         [REF_IMAGE_2K]: REF_IMAGE_2K,
         "\u77ed\u8fb9\u6700\u59272K\u50cf\u7d20": REF_IMAGE_2K,
         "Max 2K Short Edge": REF_IMAGE_2K,
+        "2K \u9762\u79ef\uff08\u7ea64MP\uff09": REF_IMAGE_2K,
+        "2K area (~4MP)": REF_IMAGE_2K,
+        [REF_IMAGE_ORIGINAL]: REF_IMAGE_ORIGINAL,
+        "\u539f\u56fe\uff08\u4e0d\u7f29\u653e\uff09": REF_IMAGE_ORIGINAL,
+        "Original (no scaling)": REF_IMAGE_ORIGINAL,
     },
     reference_mention_mode: {
         filename: "filename",
@@ -1479,7 +1498,7 @@ function patchGraphToPrompt() {
             promptNode.inputs.prompt_optimizer_scene_guide = canonicalPromptGuide(getWidgetValue(node, "prompt_optimizer_scene_guide", "none"));
             promptNode.inputs.fps = Number(getWidgetValue(node, "fps", 24));
             promptNode.inputs.keyframe_role = canonicalOption("keyframe_role", getWidgetValue(node, "keyframe_role", KEYFRAME_FIRST));
-            promptNode.inputs.ref_image_size = canonicalOption("ref_image_size", getWidgetValue(node, "ref_image_size", REF_IMAGE_1K));
+            promptNode.inputs.ref_image_size = canonicalOption("ref_image_size", getWidgetValue(node, "ref_image_size", REF_IMAGE_MATCH));
             promptNode.inputs.reference_mention_mode = canonicalOption("reference_mention_mode", getWidgetValue(node, "reference_mention_mode", "index"));
         }
         return promptData;
@@ -4822,7 +4841,7 @@ function repairConfiguredWidgetValues(node, info) {
         advanced: false,
         fps: 24,
         keyframe_role: KEYFRAME_FIRST,
-        ref_image_size: REF_IMAGE_1K,
+        ref_image_size: REF_IMAGE_MATCH,
         reference_mention_mode: "index",
         prompt_optimizer_settings: false,
         prompt_optimizer_scene_guide: "none",
