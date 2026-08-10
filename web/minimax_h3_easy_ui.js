@@ -84,6 +84,7 @@ const TEXT = {
     optimizerMissing: ZH_BROWSER ? "\u8bf7\u5148\u6253\u5f00 API \u8bbe\u7f6e\u5e76\u586b\u5199 API \u5730\u5740\u3001API Key \u548c\u6a21\u578b\u540d\u3002" : "Open API settings and enter the API URL, API key, and model first.",
     optimizerFailed: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u5931\u8d25" : "Prompt optimization failed",
     optimizerRunning: ZH_BROWSER ? "\u6b63\u5728\u4f18\u5316" : "Optimizing",
+    optimizerCancel: ZH_BROWSER ? "\u4e2d\u65ad\u4f18\u5316" : "Stop optimization",
     optimizerDone: ZH_BROWSER ? "\u4f18\u5316\u5b8c\u6210" : "Optimization complete",
     optimizerError: ZH_BROWSER ? "\u4f18\u5316\u5931\u8d25" : "Optimization failed",
     promptExternalConnected: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u6765\u81ea\u5916\u90e8\u6587\u672c\u8fde\u63a5" : "Prompt supplied by external text input",
@@ -149,6 +150,7 @@ const OPTION_DEFS = {
     },
     prompt_optimizer_api_format: {
         openai: ZH_BROWSER ? "OpenAI \u517c\u5bb9" : "OpenAI Compatible",
+        responses: "OpenAI Responses",
         gemini: ZH_BROWSER ? "Gemini \u539f\u751f" : "Gemini Native",
     },
     prompt_optimizer_scene_guide: {
@@ -3280,7 +3282,8 @@ function togglePromptView(node) {
 
 function normalizePromptOptimizerSettings(value) {
     const source = value && typeof value === "object" ? value : {};
-    const apiFormat = String(source.api_format || "openai").toLowerCase() === "gemini" ? "gemini" : "openai";
+    const requestedFormat = String(source.api_format || "openai").toLowerCase();
+    const apiFormat = ["openai", "responses", "gemini"].includes(requestedFormat) ? requestedFormat : "openai";
     return {
         api_format: apiFormat,
         api_url: String(source.api_url || "").trim(),
@@ -3644,6 +3647,16 @@ function clearPromptOptimizerStatusTimers(node) {
     node.__h3OptimizerStatusHideTimer = null;
 }
 
+function cancelPromptOptimization(node) {
+    if (!node?.__h3OptimizerPending) return;
+    node.__h3OptimizerRequestId = null;
+    node.__h3OptimizerAbortController?.abort?.();
+    node.__h3OptimizerAbortController = null;
+    node.__h3OptimizerPending = false;
+    setPromptOptimizerStatus(node, "idle");
+    syncPromptOptimizerButton(node);
+}
+
 function setPromptOptimizerStatus(node, state = "idle") {
     if (!node) return;
     clearPromptOptimizerStatusTimers(node);
@@ -3778,6 +3791,11 @@ async function optimizePromptFromEditor(node) {
     const resources = promptOptimizerResources(node);
     const mediaCounts = { image: 0, video: 0, audio: 0 };
     resources.forEach((item) => { mediaCounts[item.type] = (mediaCounts[item.type] || 0) + 1; });
+    const requestMode = canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE));
+    const requestId = Symbol("h3-prompt-optimizer");
+    const abortController = new AbortController();
+    node.__h3OptimizerRequestId = requestId;
+    node.__h3OptimizerAbortController = abortController;
     node.__h3OptimizerPending = true;
     node.__h3OptimizerStartedAt = globalThis.performance?.now?.() || Date.now();
     setPromptOptimizerStatus(node, "loading");
@@ -3786,10 +3804,11 @@ async function optimizePromptFromEditor(node) {
         const response = await api.fetchApi("/minimax_h3_easy/prompt_optimize", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: abortController.signal,
             body: JSON.stringify({
                 prompt: sourcePrompt,
                 scene_guide: state.scene_guide,
-                mode: canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE)),
+                mode: requestMode,
                 seconds: Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 5)) || 5)),
                 media_counts: mediaCounts,
                 resources,
@@ -3797,16 +3816,22 @@ async function optimizePromptFromEditor(node) {
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        if (node.__h3OptimizerRequestId !== requestId) return;
         node.__h3OptimizerSourcePrompt = sourcePrompt;
         node.__h3OptimizerLastResult = String(data.prompt || "");
         setPromptFromOptimizedText(node, node.__h3OptimizerLastResult);
         setPromptOptimizerStatus(node, "success");
     } catch (error) {
+        if (abortController.signal.aborted || node.__h3OptimizerRequestId !== requestId || error?.name === "AbortError") return;
         setPromptOptimizerStatus(node, "error");
         notifyPromptOptimizer(error?.message || error);
     } finally {
-        node.__h3OptimizerPending = false;
-        syncPromptOptimizerButton(node);
+        if (node.__h3OptimizerRequestId === requestId) {
+            node.__h3OptimizerRequestId = null;
+            node.__h3OptimizerAbortController = null;
+            node.__h3OptimizerPending = false;
+            syncPromptOptimizerButton(node);
+        }
     }
 }
 
@@ -4374,7 +4399,23 @@ function ensurePromptEditor(node) {
     const optimizerStatusSpinner = document.createElement("span");
     optimizerStatusSpinner.className = "h3-prompt-editor-status-spinner";
     const optimizerStatusText = document.createElement("span");
-    optimizerStatus.append(optimizerStatusSpinner, optimizerStatusText);
+    optimizerStatusText.className = "h3-prompt-editor-status-text";
+    const optimizerCancelButton = document.createElement("button");
+    optimizerCancelButton.type = "button";
+    optimizerCancelButton.className = "h3-prompt-editor-status-cancel";
+    optimizerCancelButton.textContent = "\u25a0";
+    optimizerCancelButton.title = TEXT.optimizerCancel;
+    optimizerCancelButton.setAttribute("aria-label", TEXT.optimizerCancel);
+    optimizerCancelButton.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+    });
+    optimizerCancelButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        cancelPromptOptimization(node);
+    });
+    optimizerStatus.append(optimizerStatusSpinner, optimizerStatusText, optimizerCancelButton);
     const viewButton = document.createElement("button");
     viewButton.type = "button";
     viewButton.className = "h3-prompt-editor-tool h3-prompt-editor-view-toggle";
@@ -5063,6 +5104,7 @@ function installNode(nodeType, nodeData) {
     const originalRemoved = nodeType.prototype.onRemoved;
     nodeType.prototype.onRemoved = function onRemovedH3Easy() {
         if (Array.isArray(this.size) && this.size.length >= 2) this.__h3EditorStableSize = [...this.size];
+        cancelPromptOptimization(this);
         clearPromptOptimizerStatusTimers(this);
         closeMentionMenu(this);
         if (this.__h3PromptInstallRetry) clearTimeout(this.__h3PromptInstallRetry);
@@ -5189,14 +5231,23 @@ function install() {
       .h3-prompt-editor:empty::before { content: attr(data-placeholder); color: var(--h3-native-widget-muted, rgba(255,255,255,.38)); pointer-events: none; }
       .h3-prompt-editor-status {
         position: absolute; left: 12px; bottom: 4px; z-index: 3; display: inline-flex; align-items: center; gap: 5px; max-width: calc(100% - 92px);
-        overflow: hidden; color: var(--h3-native-widget-text, rgba(255,255,255,.78)); opacity: .56; pointer-events: none; user-select: none;
+        overflow: hidden; color: var(--h3-native-widget-text, rgba(255,255,255,.78)); pointer-events: auto; user-select: none;
         font: 600 9px/18px Consolas, "Courier New", monospace; letter-spacing: 0; white-space: nowrap; text-overflow: ellipsis;
       }
       .h3-prompt-editor-status[hidden] { display: none !important; }
       .h3-prompt-editor-status-spinner {
-        display: inline-block; width: 8px; height: 8px; flex: 0 0 8px; box-sizing: border-box; border: 1px solid currentColor; border-radius: 50%;
+        display: inline-block; width: 8px; height: 8px; flex: 0 0 8px; box-sizing: border-box; border: 1px solid currentColor; border-radius: 50%; opacity: .56;
       }
+      .h3-prompt-editor-status-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; opacity: .56; }
       .h3-prompt-editor-status.is-loading .h3-prompt-editor-status-spinner { border-right-color: transparent; animation: h3-prompt-status-spin .72s linear infinite; }
+      .h3-prompt-editor-status-cancel {
+        appearance: none; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; flex: 0 0 16px; padding: 0;
+        border: 1px solid transparent; border-radius: 3px; outline: none; background: transparent; color: inherit; opacity: .5; cursor: pointer;
+        font: 600 7px/1 Consolas, "Courier New", monospace; letter-spacing: 0; transition: opacity .12s ease, background-color .12s ease, border-color .12s ease;
+      }
+      .h3-prompt-editor-status-cancel:hover, .h3-prompt-editor-status-cancel:focus-visible {
+        opacity: .82; background: rgba(255,255,255,.045); border-color: rgba(255,255,255,.1);
+      }
       @keyframes h3-prompt-status-spin { to { transform: rotate(360deg); } }
       .h3-prompt-editor-tools {
         position: absolute; right: 14px; bottom: 4px; z-index: 3; display: flex; align-items: center; gap: 3px; pointer-events: auto;

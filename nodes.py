@@ -375,7 +375,7 @@ def _prompt_optimizer_config_path() -> str:
 def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     source = value if isinstance(value, Mapping) else {}
     api_format = str(source.get("api_format") or "openai").strip().lower()
-    if api_format not in {"openai", "gemini"}:
+    if api_format not in {"openai", "responses", "gemini"}:
         api_format = "openai"
     read_media = source.get("read_media", False)
     if isinstance(read_media, str):
@@ -432,6 +432,8 @@ def _write_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str,
 _OPTIMIZER_KNOWN_ENDPOINT_SUFFIXES = (
     "/v1/chat/completions",
     "/chat/completions",
+    "/v1/responses",
+    "/responses",
 )
 _OPTIMIZER_GEMINI_ENDPOINT_RE = re.compile(
     r"/(v1beta|v1)/models/[^/?:#]+?:(generateContent|streamGenerateContent)$",
@@ -440,18 +442,21 @@ _OPTIMIZER_GEMINI_ENDPOINT_RE = re.compile(
 
 
 def _normalize_optimizer_base_url(api_url: str) -> str:
-    base = str(api_url or "").strip().rstrip("/")
+    base = str(api_url or "").strip()
     if not base:
         raise ValueError("Prompt optimization API URL is required")
     if not re.match(r"^https?://", base, flags=re.I):
         base = "https://" + base
-    return base.rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), parsed.query, ""))
 
 
 def _optimizer_endpoint_kind(value: str) -> str:
-    lower = str(value or "").lower()
+    lower = urllib.parse.urlsplit(str(value or "")).path.rstrip("/").lower()
     if lower.endswith("/chat/completions"):
         return "chat"
+    if lower.endswith("/responses"):
+        return "responses"
     if _OPTIMIZER_GEMINI_ENDPOINT_RE.search(lower):
         return "gemini"
     return ""
@@ -523,25 +528,61 @@ def _strip_optimizer_endpoint(base: str) -> str:
     return base
 
 
+def _optimizer_url_with_query(url: str, query: str) -> str:
+    return url + (f"?{query}" if query else "")
+
+
 def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
     if api_format == "gemini":
         return _normalize_gemini_optimizer_url(api_url, model)
     base = _normalize_optimizer_base_url(api_url)
-    endpoint = "/v1/chat/completions"
-    base_kind = _optimizer_endpoint_kind(base)
+    parsed = urllib.parse.urlsplit(base)
+    clean = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    endpoint = "/v1/responses" if api_format == "responses" else "/v1/chat/completions"
+    base_kind = _optimizer_endpoint_kind(clean)
     endpoint_kind = _optimizer_endpoint_kind(endpoint)
     if base_kind == endpoint_kind == "chat":
-        return base
-    if base_kind == endpoint_kind == "gemini":
-        base_match = _OPTIMIZER_GEMINI_ENDPOINT_RE.search(base.lower())
-        if base_match and base.lower().endswith(base_match.group(0)) and base_match.group(0) == endpoint.lower():
-            return base
-    base = _strip_optimizer_endpoint(base)
+        return _optimizer_url_with_query(clean, parsed.query)
+    if base_kind == endpoint_kind == "responses":
+        return _optimizer_url_with_query(clean, parsed.query)
+    base = _strip_optimizer_endpoint(clean)
     if base.lower().endswith("/v1") and endpoint.lower().startswith("/v1/"):
         endpoint = endpoint[3:]
-    if base.lower().endswith("/v1beta") and endpoint.lower().startswith("/v1beta/"):
-        endpoint = endpoint[7:]
-    return base + endpoint
+    return _optimizer_url_with_query(base + endpoint, parsed.query)
+
+
+def _optimizer_responses_text(data: Any) -> str:
+    if not isinstance(data, Mapping):
+        return ""
+    direct = data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    output = data.get("output")
+    chunks: list[str] = []
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, Mapping):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, Mapping):
+                    continue
+                value = part.get("text")
+                if isinstance(value, str):
+                    chunks.append(value)
+                elif isinstance(value, Mapping) and isinstance(value.get("value"), str):
+                    chunks.append(value["value"])
+    if chunks:
+        return "".join(chunks)
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {}) if isinstance(choices[0], Mapping) else {}
+        content = message.get("content", "") if isinstance(message, Mapping) else ""
+        if isinstance(content, str):
+            return content
+    return ""
 
 
 def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str, system_prompt: str, user_prompt: str, media_parts: list[dict[str, Any]] | None = None) -> str:
@@ -563,6 +604,19 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
         payload = {
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": 0.35, "maxOutputTokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS},
+        }
+    elif api_format == "responses":
+        headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {api_key}"}
+        user_content: list[dict[str, Any]] = [{"type": "input_text", "text": user_prompt}]
+        user_content.extend(media_parts)
+        payload = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": [{"role": "user", "content": user_content}],
+            "store": False,
+            "stream": False,
+            "temperature": 0.35,
+            "max_output_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS,
         }
     else:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
@@ -594,6 +648,8 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
         if not text.strip():
             finish_reason = candidate.get("finishReason") or candidate.get("finish_reason") or "unknown"
             raise RuntimeError(f"Gemini API returned no text (finish reason: {finish_reason})")
+    elif api_format == "responses":
+        text = _optimizer_responses_text(data)
     else:
         content = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "")
         text = content if isinstance(content, str) else "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
@@ -638,7 +694,11 @@ def _optimizer_media_parts(resources: list[Mapping[str, Any]], api_format: str) 
             if api_format == "gemini":
                 parts.append({"inlineData": {"mimeType": mime, "data": encoded}})
             elif media_type == "image":
-                parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+                data_url = f"data:{mime};base64,{encoded}"
+                if api_format == "responses":
+                    parts.append({"type": "input_image", "image_url": data_url})
+                else:
+                    parts.append({"type": "image_url", "image_url": {"url": data_url}})
         except (OSError, ValueError):
             continue
     return parts
@@ -703,7 +763,7 @@ class MiniMaxH3PromptOptimizer:
                 "mode": ([MODE_IMAGE, MODE_REFERENCE], {"default": MODE_IMAGE}),
                 "seconds": ("FLOAT", {"default": 5.0, "min": MIN_SECONDS, "max": MAX_SECONDS, "step": 0.1}),
                 "scene_guide": (choices, {"default": "none"}),
-                "api_format": (["openai", "gemini"], {"default": "openai"}),
+                "api_format": (["openai", "responses", "gemini"], {"default": "openai"}),
                 "api_url": ("STRING", {"default": ""}),
                 "api_key": ("STRING", {"default": "", "multiline": False, "password": True}),
                 "model": ("STRING", {"default": ""}),
@@ -760,7 +820,7 @@ def _register_prompt_optimizer_route() -> bool:
             mode = str(payload.get("mode") or MODE_IMAGE)
             scene_guide = str(payload.get("scene_guide") or "none")
             seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(payload.get("seconds") or 5.0)))
-            if api_format not in {"openai", "gemini"}:
+            if api_format not in {"openai", "responses", "gemini"}:
                 return web.json_response({"ok": False, "error": "Unsupported API format"}, status=400)
             if not prompt.strip() or not api_key.strip() or not api_url.strip() or not model.strip():
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)

@@ -95,6 +95,7 @@
 目前支持：
 
 - OpenAI-compatible Chat Completions API；
+- OpenAI Responses API；
 - Gemini Native `generateContent` API；
 - 自定义 API URL、API Key 和模型名；
 - 按节点模式选择 MiniMax H3 Prompt Guide；
@@ -112,7 +113,7 @@
 
 弹窗包含：
 
-- API 格式：OpenAI 兼容或 Gemini 原生；
+- API 格式：OpenAI 兼容、OpenAI Responses 或 Gemini 原生；
 - API 地址；
 - API Key；
 - 模型名；
@@ -147,7 +148,7 @@ ComfyUI/custom_nodes/ComfyUI-MiniMaxH3-Easy/prompt_optimizer.json
 请求：
 
 - Gemini Native 可附加图片、视频和音频；
-- OpenAI-compatible 当前只实际附加图片；
+- OpenAI-compatible Chat Completions 和 OpenAI Responses 当前都只实际附加图片；
 - 不支持、找不到或体积过大的文件会被跳过。
 
 系统规则明确要求优化模型不得编造媒体内容。如果没有实际附加文件，或者所选模型无法
