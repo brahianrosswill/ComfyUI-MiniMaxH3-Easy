@@ -1498,7 +1498,7 @@ function patchGraphToPrompt() {
             promptNode.inputs.prompt_optimizer_scene_guide = canonicalPromptGuide(getWidgetValue(node, "prompt_optimizer_scene_guide", "none"));
             promptNode.inputs.fps = Number(getWidgetValue(node, "fps", 24));
             promptNode.inputs.keyframe_role = canonicalOption("keyframe_role", getWidgetValue(node, "keyframe_role", KEYFRAME_FIRST));
-            promptNode.inputs.ref_image_size = canonicalOption("ref_image_size", getWidgetValue(node, "ref_image_size", REF_IMAGE_MATCH));
+            promptNode.inputs.ref_image_size = canonicalOption("ref_image_size", getWidgetValue(node, "ref_image_size", REF_IMAGE_1K));
             promptNode.inputs.reference_mention_mode = canonicalOption("reference_mention_mode", getWidgetValue(node, "reference_mention_mode", "index"));
         }
         return promptData;
@@ -4841,7 +4841,7 @@ function repairConfiguredWidgetValues(node, info) {
         advanced: false,
         fps: 24,
         keyframe_role: KEYFRAME_FIRST,
-        ref_image_size: REF_IMAGE_MATCH,
+        ref_image_size: REF_IMAGE_1K,
         reference_mention_mode: "index",
         prompt_optimizer_settings: false,
         prompt_optimizer_scene_guide: "none",

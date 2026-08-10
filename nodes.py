@@ -1192,7 +1192,7 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
         if not isinstance(image, torch.Tensor) or image.ndim != 4:
             raise ValueError("Image references must be IMAGE tensors")
         image_h, image_w = image.shape[1], image.shape[2]
-        size_mode = str(ref_image_size or REF_IMAGE_MATCH)
+        size_mode = str(ref_image_size or REF_IMAGE_1K)
         if size_mode == REF_IMAGE_ORIGINAL:
             # The explicit original mode keeps the incoming pixels untouched.
             # The VAE reports the latent grid actually produced for arbitrary
@@ -1320,7 +1320,7 @@ class MiniMaxH3Easy:
                 "advanced": ("BOOLEAN", {"default": False}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
                 "keyframe_role": ([KEYFRAME_FIRST, KEYFRAME_LAST], {"default": KEYFRAME_FIRST}),
-                "ref_image_size": ([REF_IMAGE_MATCH, REF_IMAGE_1K, REF_IMAGE_15K, REF_IMAGE_2K, REF_IMAGE_ORIGINAL], {"default": REF_IMAGE_MATCH}),
+                "ref_image_size": ([REF_IMAGE_MATCH, REF_IMAGE_1K, REF_IMAGE_15K, REF_IMAGE_2K, REF_IMAGE_ORIGINAL], {"default": REF_IMAGE_1K}),
                 "reference_mention_mode": ([REFERENCE_MENTION_FILENAME, REFERENCE_MENTION_INDEX], {"default": REFERENCE_MENTION_INDEX}),
                 "prompt_optimizer_settings": ("BOOLEAN", {"default": False}),
                 "prompt_optimizer_scene_guide": (
