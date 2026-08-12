@@ -253,6 +253,11 @@ This node expands `H3 Context` into standard workflow outputs:
 - Video and audio inputs are rejected in this mode.
 - Maximum: two images.
 
+First/last-frame inputs are adapted to the fixed generation canvas. When their
+aspect ratio differs from the selected video size, the node uses a centered crop
+instead of stretching the source image, keeping subjects and proportions
+natural.
+
 ### Reference Video
 
 - Maximum: nine images, three videos, and three standalone audio clips.
