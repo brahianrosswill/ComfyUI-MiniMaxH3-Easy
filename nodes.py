@@ -148,6 +148,22 @@ def _reference_aligned_size(image_w: int, image_h: int, scale: float) -> tuple[i
                 best = candidate
 
     return best[3], best[4]
+
+
+def _original_reference_size(image_w: int, image_h: int) -> tuple[int, int]:
+    """Keep original references unscaled, except for H3's required grid alignment."""
+    multiple = h3.CANVAS_MULTIPLE
+    target_w = (image_w // multiple) * multiple
+    target_h = (image_h // multiple) * multiple
+    if target_w >= multiple and target_h >= multiple:
+        return target_w, target_h
+
+    # A smaller-than-grid source cannot be crop-aligned. Scale it uniformly to
+    # the smallest usable H3 size rather than rejecting an otherwise valid input.
+    scale = max(multiple / max(1, image_w), multiple / max(1, image_h))
+    return _reference_aligned_size(image_w, image_h, scale)
+
+
 _PROMPT_OPTIMIZER_CONFIG_LOCK = threading.RLock()
 REFERENCE_PLACEHOLDER_RE = re.compile(r"__MINIMAX_H3_REF_(\d+)__")
 UNRESOLVED_REFERENCE_RE = re.compile(r"__MINIMAX_H3_UNRESOLVED_REF_[^_]+__")
@@ -1254,10 +1270,19 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
         image_h, image_w = image.shape[1], image.shape[2]
         size_mode = str(ref_image_size or REF_IMAGE_1K)
         if size_mode == REF_IMAGE_ORIGINAL:
-            # The explicit original mode keeps the incoming pixels untouched.
-            # The VAE reports the latent grid actually produced for arbitrary
-            # source dimensions, so no image-side 32-pixel resampling is needed.
-            resized = image[:1]
+            # H3 patchifies reference latents in 2x2 blocks, so their source
+            # pixels must land on a 32-pixel grid. Preserve the original image
+            # without padding or stretching by center-cropping only the small
+            # remainder; already aligned images pass through unchanged.
+            target_w, target_h = _original_reference_size(image_w, image_h)
+            if target_w == image_w and target_h == image_h:
+                resized = image[:1]
+            elif image_w >= h3.CANVAS_MULTIPLE and image_h >= h3.CANVAS_MULTIPLE:
+                top = (image_h - target_h) // 2
+                left = (image_w - target_w) // 2
+                resized = image[:1, top:top + target_h, left:left + target_w, :]
+            else:
+                resized = h3._resize(image[:1], target_w, target_h, "disabled")
             z = bundle.video_vae.encode(resized)
             ref_items.append({"type": "image", "data": resized})
             ref_blocks.append({
@@ -1390,10 +1415,6 @@ class MiniMaxH3Easy:
             },
             "optional": optional,
         }
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        return float("nan")
 
     @staticmethod
     def _collect_media(kwargs: dict) -> list[_MediaInput]:
